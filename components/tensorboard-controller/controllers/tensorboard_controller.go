@@ -167,69 +167,54 @@ func (r *TensorboardReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func generateDeployment(tb *tensorboardv1alpha1.Tensorboard, log logr.Logger, r *TensorboardReconciler) (*appsv1.Deployment, error) {
 	var volumeMounts []corev1.VolumeMount
 	var volumes []corev1.Volume
-	var mountpath, subpath string = tb.Spec.LogsPath, ""
+	logsPath := tb.Spec.LogsPath
 	var affinity = &corev1.Affinity{}
 	tensorboardImage, err := getEnvVariable("TENSORBOARD_IMAGE")
 	if err != nil {
 		return nil, err
 	}
 
+	var mountpath, subpath string = logsPath, ""
 	//In this case, a PVC is used as a log storage for the Tensorboard server.
-	if !isCloudPath(tb.Spec.LogsPath) {
+	if !isCloudPath(logsPath) {
 		var pvcname string
+		mountpath = "/tensorboard_logs/"
 
-		//General case, in which tb.Spec.LogsPath follows the format: "pvc://<pvc-name>/<local-path>".
-		if isPVCPath(tb.Spec.LogsPath) {
-			pvcname = extractPVCName(tb.Spec.LogsPath)
-			mountpath = "/tensorboard_logs/"
-			subpath = extractPVCSubPath(tb.Spec.LogsPath)
+		if isPVCPath(logsPath) {
+			// General case, in which tb.Spec.LogsPath follows the format: "pvc://<pvc-name>/<local-path>".
+			pvcname = extractPVCName(logsPath)
+			subpath = extractPVCSubPath(logsPath)
+			volumes, volumeMounts = generatePVCMount(
+				pvcname,
+				subpath,
+				mountpath,
+			)
+
+			affinity, err = generateAffinityForRWOPVC(tb, r, pvcname)
+			if err != nil {
+				return nil, err
+			}
+		} else if isHostPath(logsPath) {
+			// tb.Spec.LogPath format: host://<hostpath>
+			hostpath := extractHostAbsolutePath(logsPath)
+			volumes, volumeMounts = generateHostPathMount(hostpath, mountpath)
 		} else {
 			//Maintaining backwards compatibility with previous version of the controller.
 			pvcname = "tb-volume"
 			subpath = ""
-		}
+			volumes, volumeMounts = generatePVCMount(
+				pvcname,
+				subpath,
+				mountpath,
+			)
 
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      "tbpd",
-			ReadOnly:  true,
-			MountPath: mountpath,
-			SubPath:   subpath,
-		})
-		volumes = append(volumes, corev1.Volume{
-			Name: "tbpd",
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvcname,
-				},
-			},
-		})
-
-		if err, sch := rwoPVCScheduling(); err != nil {
-			return nil, err
-		} else if sch {
-			//If 'RWO_PVC_SCHEDULING' env var is set to "true", an extra scheduling functionality is added,
-			//for the case that the Tensorboard Server is using a RWO PVC (as a log storage)
-			//and the PVC is already mounted by another pod.
-
-			//Get the PVC that will be accessed by the Tensorboard Server.
-			var pvc = &corev1.PersistentVolumeClaim{}
-			if err := r.Get(context.Background(), client.ObjectKey{
-				Namespace: tb.Namespace,
-				Name:      pvcname,
-			}, pvc); err != nil {
-				return nil, fmt.Errorf("Get PersistentVolumeClaim error: %v", err)
-			}
-
-			//If the PVC is mounted as a ReadWriteOnce volume by a pod that is running on a node X,
-			//then we find the NodeName of X so that the Tensorboard server
-			//(that must access the volume) will be deployed on X using nodeAffinity.
-			if len(pvc.Status.AccessModes) > 0 && pvc.Status.AccessModes[0] == corev1.ReadWriteOnce {
-				if err := generateNodeAffinity(affinity, pvcname, r, tb); err != nil {
-					return nil, err
-				}
+			affinity, err = generateAffinityForRWOPVC(tb, r, pvcname)
+			if err != nil {
+				return nil, err
 			}
 		}
-	} else if isGoogleCloudPath(tb.Spec.LogsPath) {
+
+	} else if isGoogleCloudPath(logsPath) {
 		//In this case, a Google cloud bucket is used as a log storage for the Tensorboard server.
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
 			Name:      "gcp-creds",
@@ -296,6 +281,76 @@ func generateDeployment(tb *tensorboardv1alpha1.Tensorboard, log logr.Logger, r 
 			},
 		},
 	}, nil
+}
+
+// If 'RWO_PVC_SCHEDULING' env var is set to "true", an extra scheduling functionality is added,
+// for the case that the Tensorboard Server is using a RWO PVC (as a log storage)
+// and the PVC is already mounted by another pod.
+func generateAffinityForRWOPVC(tb *tensorboardv1alpha1.Tensorboard, r *TensorboardReconciler, pvcname string) (*corev1.Affinity, error) {
+	var affinity = &corev1.Affinity{}
+
+	if err, sch := rwoPVCScheduling(); err != nil {
+		return nil, err
+	} else if sch {
+		//Get the PVC that will be accessed by the Tensorboard Server.
+		var pvc = &corev1.PersistentVolumeClaim{}
+		if err := r.Get(context.Background(), client.ObjectKey{
+			Namespace: tb.Namespace,
+			Name:      pvcname,
+		}, pvc); err != nil {
+			return nil, fmt.Errorf("Get PersistentVolumeClaim error: %v", err)
+		}
+
+		//If the PVC is mounted as a ReadWriteOnce volume by a pod that is running on a node X,
+		//then we find the NodeName of X so that the Tensorboard server
+		//(that must access the volume) will be deployed on X using nodeAffinity.
+		if len(pvc.Status.AccessModes) > 0 && pvc.Status.AccessModes[0] == corev1.ReadWriteOnce {
+			if err := generateNodeAffinity(affinity, pvcname, r, tb); err != nil {
+				return nil, err
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return affinity, nil
+	}
+
+	return &corev1.Affinity{}, nil
+}
+
+func generatePVCMount(pvcname, subpath, mountpath string) ([]corev1.Volume, []corev1.VolumeMount) {
+	return []corev1.Volume{{
+			Name: "tbpd",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: pvcname,
+				},
+			},
+		}},
+		[]corev1.VolumeMount{{
+			Name:      "tbpd",
+			ReadOnly:  true,
+			MountPath: mountpath,
+			SubPath:   subpath,
+		}}
+}
+
+func generateHostPathMount(hostPath, mountPath string) ([]corev1.Volume, []corev1.VolumeMount) {
+	var hostPathType = corev1.HostPathDirectoryOrCreate
+	return []corev1.Volume{{
+			Name: "tbpd",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: hostPath,
+					Type: &hostPathType,
+				},
+			},
+		}},
+		[]corev1.VolumeMount{{
+			Name:      "tbpd",
+			ReadOnly:  true,
+			MountPath: mountPath,
+		}}
 }
 
 func generateService(tb *tensorboardv1alpha1.Tensorboard) *corev1.Service {
@@ -384,6 +439,10 @@ func isPVCPath(path string) bool {
 	return strings.HasPrefix(path, "pvc://")
 }
 
+func isHostPath(path string) bool {
+	return strings.HasPrefix(path, "host://")
+}
+
 func extractPVCName(path string) string {
 	trimmed := strings.TrimPrefix(path, "pvc://") //removing "pvc://" prefix
 	ending := strings.Index(trimmed, "/")         //finding ending index of pvc-name string
@@ -404,8 +463,12 @@ func extractPVCSubPath(path string) string {
 	}
 }
 
-//Searches a corev1.PodList for running pods and returns
-//a running corev1.Pod (if exists)
+func extractHostAbsolutePath(path string) string {
+	return "/" + strings.TrimPrefix(path, "host://")
+}
+
+// Searches a corev1.PodList for running pods and returns
+// a running corev1.Pod (if exists)
 func findRunningPod(pods *corev1.PodList) corev1.Pod {
 	for _, pod := range pods.Items {
 		if pod.Status.Phase == "Running" {
@@ -465,9 +528,9 @@ func generateNodeAffinity(affinity *corev1.Affinity, pvcname string, r *Tensorbo
 	return nil
 }
 
-//Checks the value of 'RWO_PVC_SCHEDULING' env var (if present in the environment) and returns
-//'true' or 'false' accordingly. If 'RWO_PVC_SCHEDULING' is NOT present, then the value of the
-//returned boolean is set to 'false', so that the scheduling functionality is off by default.
+// Checks the value of 'RWO_PVC_SCHEDULING' env var (if present in the environment) and returns
+// 'true' or 'false' accordingly. If 'RWO_PVC_SCHEDULING' is NOT present, then the value of the
+// returned boolean is set to 'false', so that the scheduling functionality is off by default.
 func rwoPVCScheduling() (error, bool) {
 	if value, exists := os.LookupEnv("RWO_PVC_SCHEDULING"); !exists || value == "false" || value == "False" || value == "FALSE" {
 		return nil, false
